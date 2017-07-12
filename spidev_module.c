@@ -495,7 +495,167 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
     return seq;
 }
 
-static int __spidev_set_mode( int fd, __u8 mode) {
+PyDoc_STRVAR(SpiDev_xfer_multiple_doc,
+    "xfer_multiple([[values], speed, delay, bits_per_word], ...]) -> "
+    "[[values], ...]\n\n"
+    "Perform sequential SPI transactions.\n"
+    "CS will be held active between transactions.\n");
+
+static void __spidev_xfer_multiple_cleanup_xfer_memory(
+    int num_xfers,
+    struct spi_ioc_transfer *xfers
+) {
+    for (int xfer_num = 0; xfer_num < num_xfers; ++xfer_num) {
+        if (xfers[xfer_num].tx_buf) {
+            free((void*) xfers[xfer_num].tx_buf);
+        }
+        if (xfers[xfer_num].rx_buf) {
+            free((void*) xfers[xfer_num].rx_buf);
+        }
+    }
+    free(xfers);
+}
+
+static PyObject *
+SpiDev_xfer_multiple(SpiDevObject *self, PyObject *args)
+{
+    char wrmsg_text[4096];
+
+    PyObject *obj = NULL;
+    if (!PyArg_ParseTuple(args, "O:xfer_multiple", &obj)) {
+        return NULL;
+    }
+
+    PyObject *seq = PySequence_Fast(obj, "expected a sequence");
+    int num_xfers = PySequence_Fast_GET_SIZE(obj);
+    if (!seq || num_xfers <= 0) {
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+        return NULL;
+    }
+    if (num_xfers > SPIDEV_MAXPATH) {
+        Py_DECREF(seq);
+        snprintf(
+            wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
+        PyErr_SetString(PyExc_OverflowError, wrmsg_text);
+        return NULL;
+    }
+
+    if (num_xfers <= 0) {
+        Py_DECREF(seq);
+        return NULL;
+    }
+
+    struct spi_ioc_transfer *xfers = malloc(
+        sizeof(struct spi_ioc_transfer) * num_xfers);
+    if (xfers == NULL) {
+        Py_DECREF(seq);
+        return PyErr_NoMemory();
+    }
+    memset(xfers, 0, sizeof(struct spi_ioc_transfer) * num_xfers);
+
+    for (int xfer_num = 0; xfer_num < num_xfers; ++xfer_num) {
+        PyObject *xfer_info_obj = PySequence_Fast_GET_ITEM(seq, xfer_num);
+        Py_INCREF(xfer_info_obj);
+        PyObject *value_obj = NULL;
+        uint32_t max_speed_hz = 0;
+        uint16_t delay_usecs = 0;
+        uint8_t bits_per_word = 0;
+        if (!PyArg_ParseTuple(
+                xfer_info_obj,
+                "OIHB; transfer info tuple should contain (data, "
+                "max_speed_hz, delay_usecs, bits_per_word)",
+                &value_obj, &max_speed_hz, &delay_usecs, &bits_per_word)) {
+            Py_DECREF(seq);
+            __spidev_xfer_multiple_cleanup_xfer_memory(num_xfers, xfers);
+            return NULL;
+        }
+
+        PyObject *data_seq = PySequence_Fast(
+            value_obj, "data must be a sequence");
+        if (data_seq == NULL) {
+            Py_DECREF(xfer_info_obj);
+            Py_DECREF(seq);
+            __spidev_xfer_multiple_cleanup_xfer_memory(num_xfers, xfers);
+            return NULL;
+        }
+        Py_INCREF(data_seq);
+
+        int len = PySequence_Fast_GET_SIZE(data_seq);
+        int bytes_per_word = (
+            bits_per_word / sizeof(__u8) +
+            (bits_per_word % sizeof(__u8)) ? 1 : 0);
+
+        // TODO(ssloboda) eliminate this requirement
+        assert(bytes_per_word == 1);
+
+        char *tx_buf = malloc(bytes_per_word * len);
+        if (tx_buf == NULL) {
+            Py_DECREF(xfer_info_obj);
+            Py_DECREF(data_seq);
+            __spidev_xfer_multiple_cleanup_xfer_memory(num_xfers, xfers);
+            Py_DECREF(seq);
+            return PyErr_NoMemory();
+        }
+        char *rx_buf = malloc(bytes_per_word * len);
+        if (rx_buf == NULL) {
+            Py_DECREF(xfer_info_obj);
+            Py_DECREF(data_seq);
+            __spidev_xfer_multiple_cleanup_xfer_memory(num_xfers, xfers);
+            Py_DECREF(seq);
+            return PyErr_NoMemory();
+        }
+
+        for (int i = 0; i < bytes_per_word * len; i += bytes_per_word) {
+            PyObject *item = PySequence_Fast_GET_ITEM(data_seq, i);
+            int byte = PyLong_AsLong(item);
+            assert(byte >= 0 && byte <= 255);
+            tx_buf[i] = byte;
+            Py_DECREF(item);
+        }
+
+        memset(rx_buf, 0xFF, bytes_per_word * len);
+
+        xfers[xfer_num].tx_buf = (unsigned long) tx_buf;
+        xfers[xfer_num].rx_buf = (unsigned long) rx_buf;
+        xfers[xfer_num].len = len;
+        xfers[xfer_num].speed_hz =
+            max_speed_hz ? max_speed_hz : self->max_speed_hz;
+        xfers[xfer_num].bits_per_word =
+            bits_per_word ? bits_per_word : self->bits_per_word;
+        //  See linux: include/linux/spi/spi.h for a correct explanation of
+        //  `cs_change`. The docs in linux: include/uapi/linux/spi/spidev.h are
+        //  misleading.
+        xfers[xfer_num].cs_change = 0;
+
+        Py_DECREF(xfer_info_obj);
+        Py_DECREF(data_seq);
+    }
+
+    PyObject* retval = NULL;
+    if (ioctl(self->fd, SPI_IOC_MESSAGE(num_xfers), xfers) < 0) {
+        PyErr_SetFromErrno(PyExc_IOError);
+    } else {
+        retval = PyList_New(0);
+        for (int xfer_num = 0; xfer_num < num_xfers; ++xfer_num) {
+            PyObject *data = PyList_New(0);
+            for (unsigned int i = 0; i < xfers[xfer_num].len; ++i) {
+                uint8_t *rx_buf = (uint8_t *) xfers[xfer_num].rx_buf;
+                PyObject *int_obj = PyInt_FromLong(rx_buf[i]);
+                PyList_Append(data, int_obj);
+                Py_DECREF(int_obj);
+            }
+            PyList_Append(retval, data);
+            Py_DECREF(data);
+        }
+    }
+
+    __spidev_xfer_multiple_cleanup_xfer_memory(num_xfers, xfers);
+    Py_DECREF(seq);
+    return retval;
+}
+
+static int __spidev_set_mode(int fd, __u8 mode) {
     __u8 test;
     if (ioctl(fd, SPI_IOC_WR_MODE, &mode) == -1) {
         PyErr_SetFromErrno(PyExc_IOError);
@@ -1005,6 +1165,8 @@ static PyMethodDef SpiDev_methods[] = {
         SpiDev_xfer_doc},
     {"xfer2", (PyCFunction)SpiDev_xfer2, METH_VARARGS,
         SpiDev_xfer2_doc},
+    {"xfer_multiple", (PyCFunction)SpiDev_xfer_multiple, METH_VARARGS,
+        SpiDev_xfer_multiple_doc},
     {"__enter__", (PyCFunction)SpiDev_enter, METH_VARARGS,
         NULL},
     {"__exit__", (PyCFunction)SpiDev_exit, METH_VARARGS,
