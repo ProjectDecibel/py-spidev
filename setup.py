@@ -33,6 +33,6 @@ setup(	name		= "spidev",
 	maintainer_email= "scaudle@doceme.com",
 	license		= "GPLv2",
 	classifiers	= classifiers,
-	url		= "http://github.com/doceme/py-spidev",
+	url		= "http://github.com/ProjectDecibel/py-spidev",
 	ext_modules	= [Extension("spidev", ["spidev_module.c"])]
 )
