@@ -27,7 +27,7 @@
 #include <sys/ioctl.h>
 #include <linux/ioctl.h>
 
-#define _VERSION_ "3.3"
+#define _VERSION_ "3.4"
 #define SPIDEV_MAXPATH 4096
 
 
